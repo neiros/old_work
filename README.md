@@ -1,9 +1,5 @@
 # ---TTC---
 
-Сторонняя поддержка и пожертвования за все время(all donations) :)))
+This branch only for this page - http://ss-iqr.blogspot.ru/2017/09/ttc.html
 
-BTC: 1yirJsnmjsTDNCMknokaaYE2kkqYZiUhJ
-
-LTC: LNSDetWtrYFpRreeRbJxewd9h8dHkEZv6X
-
-VTC: VaojHmM6xsFqbzvXqpPK9mJSwokGq25KPk
+Two solutions to the big bitcoin problem, where transaction fees do not compensate for the costs of mining.
