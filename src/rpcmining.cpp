@@ -27,6 +27,320 @@ void ShutdownRPCMining()
     delete pMiningKey; pMiningKey = NULL;
 }
 
+
+Value getblocktarget(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "getblocktarget <hash>\n"
+            "Returns block target.");
+
+    std::string strHash = params[0].get_str();
+    uint256 hash(strHash);
+
+    if (mapBlockIndex.count(hash) == 0)
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
+
+    CBlock block;
+    CBlockIndex* pblockindex = mapBlockIndex[hash];
+    ReadBlockFromDisk(block, pblockindex);
+
+    CBigNum sumTrDif = 0;
+    CBigNum maxBigNum = CBigNum(~uint256(0));
+    BOOST_FOREACH(CTransaction& tx, block.vtx)
+    {
+        if (!tx.IsCoinBase())
+        {
+            TransM trM;
+            BOOST_FOREACH(const CTxIn& txin, tx.vin)
+                trM.vinM.push_back(CTxIn(txin.prevout.hash, txin.prevout.n));
+
+            BOOST_FOREACH (const CTxOut& out, tx.vout)
+                trM.voutM.push_back(CTxOut(out.nValue, CScript()));
+
+            int txBl = abs(tx.tBlock);
+            if (txBl >= pblockindex->nHeight - 1)
+                txBl = pblockindex->nHeight - 1 - TX_TBLOCK;
+
+            trM.hashBlock = vBlockIndexByHeight[txBl]->GetBlockHash();
+
+            uint256 HashTr = SerializeHash(trM);
+            lyra2re2_hashTX(BEGIN(HashTr), BEGIN(HashTr), 32);
+            CBigNum bntx = CBigNum(HashTr);
+            sumTrDif += (maxBigNum / bntx) / (pblockindex->nHeight - 1 - txBl);
+        }
+    }
+
+    CBigNum divideTarget = (maxBigNum / CBigNum().SetCompact(block.nBits)) - 1;
+
+    int precision = 1000;
+    double snowfox = 1.05;
+    double CDFtrdt = 1 - exp(- (snowfox * sumTrDif.getuint256().getdouble()) / divideTarget.getuint256().getdouble());
+    double CDFsize = 1 - exp(- (double)block.vtx.size() / (double)QUANTITY_TX);
+
+    int backlash = precision * CDFtrdt * CDFsize;
+
+    uint256 hashTarget = (maxBigNum / (1 + divideTarget - (divideTarget / precision) * backlash)).getuint256();
+
+    Object obj;
+    obj.push_back(Pair("block ",            block.GetHash().GetHex()));
+    obj.push_back(Pair("target",            hashTarget.GetHex()));
+    obj.push_back(Pair("old tar",           CBigNum().SetCompact(block.nBits).getuint256().GetHex()));
+    obj.push_back(Pair("total tx",          (boost::int64_t)block.vtx.size()));
+    obj.push_back(Pair("CDFtrdt",           CDFtrdt));
+    obj.push_back(Pair("CDFsize",           CDFsize));
+    obj.push_back(Pair("backlash",          backlash));
+    obj.push_back(Pair("decrease ~ %",      ((divideTarget / precision) * backlash).getuint256().getdouble() / divideTarget.getuint256().getdouble()));
+    obj.push_back(Pair("maxBigNum",         maxBigNum.getuint256().getdouble()));
+    obj.push_back(Pair("divideTarget",      divideTarget.getuint256().getdouble()));
+    obj.push_back(Pair("- sumTrDif -",      sumTrDif.getuint256().getdouble()));
+
+    return obj;
+}
+
+
+Value usetxinblock(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "usetxinblock <hash>\n"
+            "Returns an object containing block and transaction hashes related information.");
+
+    std::string strHash = params[0].get_str();
+    uint256 hash(strHash);
+
+    if (mapBlockIndex.count(hash) == 0)
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
+
+    CBlock block;
+    CBlockIndex* pblockindex = mapBlockIndex[hash];
+    ReadBlockFromDisk(block, pblockindex);
+
+    int64 txFees = 0;
+    BOOST_FOREACH(CTransaction& tx, block.vtx)
+    {
+        if (!tx.IsCoinBase())
+        {
+            int64 nIn = 0;
+            BOOST_FOREACH(const CTxIn& txin, tx.vin)
+            {
+                CTransaction getTx;
+                const uint256 txHash = txin.prevout.hash;
+                uint256 hashBlock = 0;
+                if (GetTransaction(txHash, getTx, hashBlock, false))
+                    nIn += getTx.vout[txin.prevout.n].nValue;
+                //else проверка ошибок, если нужно
+            }
+
+            int64 nOut = 0;
+            BOOST_FOREACH (CTxOut& out, tx.vout)
+            {
+                nOut += out.nValue;
+            }
+
+            txFees = nIn - nOut;
+        }
+    }
+
+    Object obj;
+    obj.push_back(Pair("block",             block.GetHash().GetHex()));
+    obj.push_back(Pair("tx",                (boost::int64_t)block.vtx.size() - 1));
+    obj.push_back(Pair("txFees",            ValueFromAmount(txFees)));
+    obj.push_back(Pair("subsidy block",     ValueFromAmount(GetBlockValue(pblockindex->nHeight, txFees))));
+
+    for (int i = 0; i < (int)BLOCK_TX_FEE; i++)
+        obj.push_back(Pair(" - block", vBlockIndexByHeight[pblockindex->nHeight - i - 1]->GetBlockHash().GetHex()));
+
+
+    vector<TxHashPriority> vecTxHashPriority;
+    std::map<uint256, uint256> mapTxHashes;
+
+    if (pblockindex->nHeight > int(BLOCK_TX_FEE + NUMBER_BLOCK_TX))
+    {
+        uint256 useHashBack;
+        for (unsigned int i = 0; i < NUMBER_BLOCK_TX; i++)                      // получение транзакций которым возможен возврат комиссий
+        {
+            CBlock rBlock;
+            int bHeight = pblockindex->nHeight - BLOCK_TX_FEE - i - 1;
+
+            ReadBlockFromDisk(rBlock, vBlockIndexByHeight[bHeight]);             // -5, -6, -7, -8, -9 блоки
+//            ReadBlockFromDisk(rBlock, vBlockIndexByHeight[pblockindex->nHeight - BLOCK_TX_FEE - i - 1]);
+
+
+            obj.push_back(Pair("block",     rBlock.GetHash().GetHex()));
+            obj.push_back(Pair("tx",        (boost::int64_t)rBlock.vtx.size() - 1));
+
+
+            if (i == 0)
+                useHashBack = rBlock.GetHash();                                 // хэш(uint256) блока для определения случайных позиций
+
+            BOOST_FOREACH(CTransaction& tx, rBlock.vtx)
+            {
+                if (!tx.IsCoinBase())
+                {
+                    TransM trM;
+
+                    int64 nIn = 0;
+                    BOOST_FOREACH(const CTxIn& txin, tx.vin)
+                    {
+                        trM.vinM.push_back(CTxIn(txin.prevout.hash, txin.prevout.n));
+
+                        CTransaction getTx;
+                        const uint256 txHash = txin.prevout.hash;
+                        uint256 hashBlock = 0;
+                        if (GetTransaction(txHash, getTx, hashBlock, false))
+                            nIn += getTx.vout[txin.prevout.n].nValue;
+                        //else проверка ошибок, если нужно
+                    }
+
+                    int64 nOut = 0;
+                    BOOST_FOREACH (CTxOut& out, tx.vout)
+                    {
+                        trM.voutM.push_back(CTxOut(out.nValue, CScript()));
+                        nOut += out.nValue;
+                    }
+
+                    int64 nTxFees = nIn - nOut;
+
+                    int txBl = abs(tx.tBlock);
+                    if (txBl >= bHeight)
+                        txBl = bHeight - TX_TBLOCK;         // TX_TBLOCK от pindexBest (bool CWallet::CreateTransaction)
+
+                    trM.hashBlock = vBlockIndexByHeight[txBl]->GetBlockHash();
+
+                    uint256 HashTrM = SerializeHash(trM);
+                    lyra2re2_hashTX(BEGIN(HashTrM), BEGIN(HashTrM), 32);
+
+                    CTransaction getTx;
+                    const uint256 txHash = tx.vin[0].prevout.hash;
+                    uint256 hashBlock = 0;
+                    if (GetTransaction(txHash, getTx, hashBlock, false))
+                        vecTxHashPriority.push_back(TxHashPriority(HashTrM, CTxOut(nTxFees, getTx.vout[tx.vin[0].prevout.n].scriptPubKey)));
+
+                    mapTxHashes[HashTrM] = tx.GetHash();
+                }
+            }
+
+            if (vecTxHashPriority.size() > QUANTITY_TX)
+                break;
+        }
+
+        obj.push_back(Pair("total tx",     (boost::int64_t)vecTxHashPriority.size()));
+
+        if (vecTxHashPriority.size() > 1)
+        {
+            TxHashPriorityCompare comparerHash(true);
+            std::sort(vecTxHashPriority.begin(), vecTxHashPriority.end(), comparerHash);
+
+
+            double powsqrt = (useHashBack & CBigNum(uint256(65535)).getuint256()).getdouble() * 0.00001 + 1.2;  // получаем число от 1,2 до 1,85535
+            unsigned int stepTr = pow((double)vecTxHashPriority.size(), 1.0 / powsqrt);                         // величина промежутка
+            unsigned int numPosition = vecTxHashPriority.size() / stepTr;                                       // количество промежутков
+            unsigned int arProgression = stepTr / numPosition;          // аргумент арифметической прогрессии при котором последний промежуток почти равен первым двум
+
+            obj.push_back(Pair("random one",         powsqrt));
+            powsqrt = (useHashBack & CBigNum(uint256(262143)).getuint256()).getdouble() * 0.000001;             // число от 0 до 0,262143
+            obj.push_back(Pair("random two",         0.4 + powsqrt));
+            unsigned int retFeesTr = (stepTr + 1) * (0.4 + powsqrt);    // во сколько раз нужно умножить возвращаемую комиссию (+1 чтобы не было 0)
+
+
+            unsigned int pos = 0;
+            unsigned int nextInt = 0;
+            unsigned int ntx = 0;
+            unsigned int www = 0;
+            unsigned int iii = 0;
+            BOOST_FOREACH(const TxHashPriority& tx, vecTxHashPriority)
+            {
+                if (nextInt == iii)
+                {
+                    useHashBack = Hash(BEGIN(useHashBack),  END(useHashBack));
+                    unsigned int interval = stepTr + www * arProgression;                     // разбивка vecTxHashPriority на промежутки
+                    pos = nextInt + interval * (useHashBack & CBigNum(uint256(1048575)).getuint256()).getdouble() / 1048575.0;   // получаем число от 0 до 1
+                    nextInt = iii + interval + 1;
+                    www++;
+
+                    obj.push_back(Pair("interval",              (boost::int64_t)interval));
+                    obj.push_back(Pair("start next interval",   (boost::int64_t)nextInt));
+                }
+
+                if (iii == pos)
+                {
+                    ntx++;
+                    obj.push_back(Pair("this",                  "tx"));
+                    obj.push_back(Pair(tx.get<0>().GetHex(),    mapTxHashes[tx.get<0>()].GetHex()));
+                    obj.push_back(Pair("fee",                   ValueFromAmount(tx.get<1>().nValue)));
+                    obj.push_back(Pair("fee return",            ValueFromAmount(tx.get<1>().nValue * retFeesTr)));
+
+                    CTxDestination address;
+                    if (ExtractDestination(tx.get<1>().scriptPubKey, address))
+                        obj.push_back(Pair("address",           CBitcoinAddress(address).ToString()));
+                }
+                else
+                    obj.push_back(Pair(tx.get<0>().GetHex(),    mapTxHashes[tx.get<0>()].GetHex()));
+                iii++;
+            }
+            obj.push_back(Pair("selected transactions",         (boost::int64_t)ntx));
+            obj.push_back(Pair("increase fee in",               (boost::int64_t)retFeesTr));
+        }
+    }
+
+    return obj;
+}
+
+
+// Return average network hashes per second based on the last 'lookup' blocks,
+// or from the last difficulty change if 'lookup' is nonpositive.
+// If 'height' is nonnegative, compute the estimate at the time when a given block was found.
+Value GetNetworkHashPS(int lookup, int height) {
+    CBlockIndex *pb = pindexBest;
+
+    if (height >= 0 && height < nBestHeight)
+        pb = FindBlockByHeight(height);
+
+    if (pb == NULL || !pb->nHeight)
+        return 0;
+
+    // If lookup is -1, then use blocks since last difficulty change.
+    if (lookup <= 0)
+        lookup = pb->nHeight % 2016 + 1;
+
+    // If lookup is larger than chain, then set it to chain length.
+    if (lookup > pb->nHeight)
+        lookup = pb->nHeight;
+
+    CBlockIndex *pb0 = pb;
+    int64 minTime = pb0->GetBlockTime();
+    int64 maxTime = minTime;
+    for (int i = 0; i < lookup; i++) {
+        pb0 = pb0->pprev;
+        int64 time = pb0->GetBlockTime();
+        minTime = std::min(time, minTime);
+        maxTime = std::max(time, maxTime);
+    }
+
+    // In case there's a situation where minTime == maxTime, we don't want a divide by zero exception.
+    if (minTime == maxTime)
+        return 0;
+
+    uint256 workDiff = pb->nChainWork - pb0->nChainWork;
+    int64 timeDiff = maxTime - minTime;
+
+    return (boost::int64_t)(workDiff.getdouble() / timeDiff);
+}
+
+Value getnetworkhashps(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() > 2)
+        throw runtime_error(
+            "getnetworkhashps [blocks] [height]\n"
+            "Returns the estimated network hashes per second based on the last 120 blocks.\n"
+            "Pass in [blocks] to override # of blocks, -1 specifies since last difficulty change.\n"
+            "Pass in [height] to estimate the network speed at the time when a certain block was found.");
+
+    return GetNetworkHashPS(params.size() > 0 ? params[0].get_int() : 120, params.size() > 1 ? params[1].get_int() : -1);
+}
+
+
 Value getgenerate(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() != 0)
@@ -59,7 +373,7 @@ Value setgenerate(const Array& params, bool fHelp)
     }
     mapArgs["-gen"] = (fGenerate ? "1" : "0");
 
-    GenerateBitcoins(fGenerate, pwalletMain);
+    GenerateCoins(fGenerate, pwalletMain);
     return Value::null;
 }
 
@@ -112,10 +426,10 @@ Value getwork(const Array& params, bool fHelp)
             "If [data] is specified, tries to solve the block and returns true if it was successful.");
 
     if (vNodes.empty())
-        throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "---TTC--- is not connected!");
+        throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "TTC is not connected!");
 
     if (IsInitialBlockDownload())
-        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "---TTC--- is downloading blocks...");
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "TTC is downloading blocks...");
 
     typedef map<uint256, pair<CBlock*, CScript> > mapNewBlock_t;
     static mapNewBlock_t mapNewBlock;    // FIXME: thread safety
@@ -208,7 +522,39 @@ Value getwork(const Array& params, bool fHelp)
         pblock->vtx[0].vin[0].scriptSig = mapNewBlock[pdata->hashMerkleRoot].second;
         pblock->hashMerkleRoot = pblock->BuildMerkleTree();
 
-        return CheckWork(pblock, *pwalletMain, *pMiningKey);
+
+//*****************************************************************
+        CBigNum maxBigNum = CBigNum(~uint256(0));
+        CBigNum sumTrDif = 0;
+
+        BOOST_FOREACH(CTransaction& tx, pblock->vtx)
+        {
+            if (!tx.IsCoinBase())
+            {
+                TransM trM;
+                BOOST_FOREACH(const CTxIn& txin, tx.vin)
+                    trM.vinM.push_back(CTxIn(txin.prevout.hash, txin.prevout.n));
+
+                BOOST_FOREACH (const CTxOut& out, tx.vout)
+                    trM.voutM.push_back(CTxOut(out.nValue, CScript()));
+
+                int txBl = abs(tx.tBlock);
+                if (txBl >= pindexBest->nHeight)
+                    txBl = pindexBest->nHeight - TX_TBLOCK; // TX_TBLOCK от pindexBest (bool CWallet::CreateTransaction)
+
+                trM.hashBlock = vBlockIndexByHeight[txBl]->GetBlockHash();
+
+                uint256 hashTr = SerializeHash(trM);
+                lyra2re2_hashTX(BEGIN(hashTr), BEGIN(hashTr), 32);
+                CBigNum bntx = CBigNum(hashTr);
+                sumTrDif += (maxBigNum / bntx) / (pindexBest->nHeight - txBl);   // защита от 51% с использованием майнингхешей транзакций ссылающихся на более старые блоки
+            }
+        }
+
+        return CheckWork(pblock, *pwalletMain, *pMiningKey, sumTrDif);
+
+//*****************************************************************
+//        return CheckWork(pblock, *pwalletMain, *pMiningKey);
     }
 }
 
@@ -254,10 +600,10 @@ Value getblocktemplate(const Array& params, bool fHelp)
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid mode");
 
     if (vNodes.empty())
-        throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "---TTC--- is not connected!");
+        throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "TTC is not connected!");
 
     if (IsInitialBlockDownload())
-        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "---TTC--- is downloading blocks...");
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "TTC is downloading blocks...");
 
     // Update block                                                             Обновление блока
     static unsigned int nTransactionsUpdatedLast;
@@ -357,6 +703,19 @@ Value getblocktemplate(const Array& params, bool fHelp)
     result.push_back(Pair("curtime", (int64_t)pblock->nTime));
     result.push_back(Pair("bits", HexBits(pblock->nBits)));
     result.push_back(Pair("height", (int64_t)(pindexPrev->nHeight+1)));
+
+    Array FeeBack;
+    for (unsigned int i = 0; pblocktemplate->vBackWhither.size() > i; i++)
+    {
+        Object entry;
+
+        CDataStream TxOut(SER_NETWORK, PROTOCOL_VERSION);
+        TxOut << pblocktemplate->vBackWhither[i];
+
+        entry.push_back(Pair("BackWhither", HexStr(TxOut.begin(), TxOut.end())));
+        FeeBack.push_back(entry);
+    }
+    result.push_back(Pair("FeeBack", FeeBack));
 
     return result;
 }

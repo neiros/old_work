@@ -18,10 +18,10 @@ using namespace std;
 // mapWallet
 //
 
-struct CompareValueOnly
+struct CompareDepthOnly
 {
-    bool operator()(const pair<int64, pair<const CWalletTx*, unsigned int> >& t1,
-                    const pair<int64, pair<const CWalletTx*, unsigned int> >& t2) const
+    bool operator()(const pair<int, pair<const CWalletTx*, unsigned int> >& t1,
+                    const pair<int, pair<const CWalletTx*, unsigned int> >& t2) const
     {
         return t1.first < t2.first;
     }
@@ -1021,51 +1021,6 @@ void CWallet::AvailableCoins(vector<COutput>& vCoins, bool fOnlyConfirmed) const
     }
 }
 
-static void ApproximateBestSubset(vector<pair<int64, pair<const CWalletTx*,unsigned int> > >vValue, int64 nTotalLower, int64 nTargetValue,
-                                  vector<char>& vfBest, int64& nBest, int iterations = 1000)
-{
-    vector<char> vfIncluded;
-
-    vfBest.assign(vValue.size(), true);
-    nBest = nTotalLower;
-
-    seed_insecure_rand();
-
-    for (int nRep = 0; nRep < iterations && nBest != nTargetValue; nRep++)
-    {
-        vfIncluded.assign(vValue.size(), false);
-        int64 nTotal = 0;
-        bool fReachedTarget = false;
-        for (int nPass = 0; nPass < 2 && !fReachedTarget; nPass++)
-        {
-            for (unsigned int i = 0; i < vValue.size(); i++)
-            {
-                //The solver here uses a randomized algorithm,                          Решение здесь использует вероятностный алгоритм,
-                //the randomness serves no real security purpose but is just            случайности не служит никакой реальной цели безопасности, но только
-                //needed to prevent degenerate behavior and it is important             для предотвращения вырожденных поведение, и важно
-                //that the rng fast. We do not use a constant random sequence,          что rng быстрее. Мы не используем постоянной случайной последовательности,
-                //because there may be some privacy improvement by making               потому что могут быть некоторые улучшения конфиденциальности, сделав
-                //the selection random.                                                 выбор случайного.
-                if (nPass == 0 ? insecure_rand()&1 : !vfIncluded[i])
-                {
-                    nTotal += vValue[i].first;
-                    vfIncluded[i] = true;
-                    if (nTotal >= nTargetValue)
-                    {
-                        fReachedTarget = true;
-                        if (nTotal < nBest)
-                        {
-                            nBest = nTotal;
-                            vfBest = vfIncluded;
-                        }
-                        nTotal -= vValue[i].first;
-                        vfIncluded[i] = false;
-                    }
-                }
-            }
-        }
-    }
-}
 
 bool CWallet::SelectCoinsMinConf(int64 nTargetValue, int nConfMine, int nConfTheirs, vector<COutput> vCoins,
                                  set<pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64& nValueRet) const
@@ -1073,99 +1028,36 @@ bool CWallet::SelectCoinsMinConf(int64 nTargetValue, int nConfMine, int nConfThe
     setCoinsRet.clear();
     nValueRet = 0;
 
-    // List of values less than target                                                  Список значений меньше целевого
-    pair<int64, pair<const CWalletTx*,unsigned int> > coinLowestLarger;
-    coinLowestLarger.first = std::numeric_limits<int64>::max();
-    coinLowestLarger.second.first = NULL;
-    vector<pair<int64, pair<const CWalletTx*,unsigned int> > > vValue;
-    int64 nTotalLower = 0;
-
-    random_shuffle(vCoins.begin(), vCoins.end(), GetRandInt);
-
+    vector<pair<int, pair<const CWalletTx*,unsigned int> > > vDepth;
     BOOST_FOREACH(COutput output, vCoins)
     {
-        const CWalletTx *pcoin = output.tx;
-
-        if (output.nDepth < (pcoin->IsFromMe() ? nConfMine : nConfTheirs))
+        if (output.nDepth < (output.tx->IsFromMe() ? nConfMine : nConfTheirs))
             continue;
+        vDepth.push_back(make_pair(output.nDepth, make_pair(output.tx, output.i)));
+    }
+    sort(vDepth.rbegin(), vDepth.rend(), CompareDepthOnly());
 
-        int i = output.i;
-        int64 n = pcoin->vout[i].nValue;
+//    typedef pair<int, pair<const CWalletTx*,unsigned int> > tt;
+//    BOOST_FOREACH(tt TxDepth, vDepth)
+//        printf("vDepth %i   %"PRI64d"\n", TxDepth.first, TxDepth.second.first->vout[TxDepth.second.second].nValue);
 
-        pair<int64,pair<const CWalletTx*,unsigned int> > coin = make_pair(n,make_pair(pcoin, i));
-
-        if (n == nTargetValue)
-        {
-            setCoinsRet.insert(coin.second);
-            nValueRet += coin.first;
-            return true;
-        }
-        else if (n < nTargetValue + CENT)
-        {
-            vValue.push_back(coin);
-            nTotalLower += n;
-        }
-        else if (n < coinLowestLarger.first)
-        {
-            coinLowestLarger = coin;
-        }
+    for (unsigned int i = 0; i < vDepth.size(); ++i)
+    {
+//printf("\nvDepth[%i] %i   %"PRI64d"\n", i, vDepth[i].first, vDepth[i].second.first->vout[vDepth[i].second.second].nValue);
+        setCoinsRet.insert(vDepth[i].second);
+        nValueRet += vDepth[i].second.first->vout[vDepth[i].second.second].nValue;
+        if (nValueRet >= nTargetValue)
+            break;
     }
 
-    if (nTotalLower == nTargetValue)
+    if (nValueRet < nTargetValue)
     {
-        for (unsigned int i = 0; i < vValue.size(); ++i)
-        {
-            setCoinsRet.insert(vValue[i].second);
-            nValueRet += vValue[i].first;
-        }
+//        printf("ERROR: The amount exceeds your balance : value in %"PRI64d" < value out %"PRI64d"\n", nValueRet, nTargetValue);
+        return false;
+    }
+    else
         return true;
-    }
 
-    if (nTotalLower < nTargetValue)
-    {
-        if (coinLowestLarger.second.first == NULL)
-            return false;
-        setCoinsRet.insert(coinLowestLarger.second);
-        nValueRet += coinLowestLarger.first;
-        return true;
-    }
-
-    // Solve subset sum by stochastic approximation                                     Решение подмножества суммы для стохастической аппроксимации
-    sort(vValue.rbegin(), vValue.rend(), CompareValueOnly());
-    vector<char> vfBest;
-    int64 nBest;
-
-    ApproximateBestSubset(vValue, nTotalLower, nTargetValue, vfBest, nBest, 1000);
-    if (nBest != nTargetValue && nTotalLower >= nTargetValue + CENT)
-        ApproximateBestSubset(vValue, nTotalLower, nTargetValue + CENT, vfBest, nBest, 1000);
-
-    // If we have a bigger coin and (either the stochastic approximation didn't find a good solution,
-    //                                   or the next bigger coin is closer), return the bigger coin
-    // Если у нас есть большие монеты и (или стохастической аппроксимации не найти хорошее решение,
-    //                                   или следующий больший монету ближе), вернуть большую монету
-    if (coinLowestLarger.second.first &&
-        ((nBest != nTargetValue && nBest < nTargetValue + CENT) || coinLowestLarger.first <= nBest))
-    {
-        setCoinsRet.insert(coinLowestLarger.second);
-        nValueRet += coinLowestLarger.first;
-    }
-    else {
-        for (unsigned int i = 0; i < vValue.size(); i++)
-            if (vfBest[i])
-            {
-                setCoinsRet.insert(vValue[i].second);
-                nValueRet += vValue[i].first;
-            }
-
-        //// debug print
-        printf("SelectCoins() best subset: ");
-        for (unsigned int i = 0; i < vValue.size(); i++)
-            if (vfBest[i])
-                printf("%s ", FormatMoney(vValue[i].first).c_str());
-        printf("total %s\n", FormatMoney(nBest).c_str());
-    }
-
-    return true;
 }
 
 bool CWallet::SelectCoins(int64 nTargetValue, set<pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64& nValueRet) const
@@ -1178,185 +1070,12 @@ bool CWallet::SelectCoins(int64 nTargetValue, set<pair<const CWalletTx*,unsigned
             SelectCoinsMinConf(nTargetValue, 0, 1, vCoins, setCoinsRet, nValueRet));
 }
 
-bool CWallet::CreateTransactionOLD(const vector<pair<CScript, int64> >& vecSend,
-                                CWalletTx& wtxNew, CReserveKey& reservekey, int64& nFeeRet, std::string& strFailReason)
-{
-    int64 nValue = 0;
-    BOOST_FOREACH (const PAIRTYPE(CScript, int64)& s, vecSend)
-    {
-        if (nValue < 0)
-        {
-            strFailReason = _("Transaction amounts must be positive");
-            return false;
-        }
-        nValue += s.second;
-    }
-    if (vecSend.empty() || nValue < 0)
-    {
-        strFailReason = _("Transaction amounts must be positive");
-        return false;
-    }
-
-    wtxNew.BindWallet(this);
-
-    {
-        LOCK2(cs_main, cs_wallet);
-        {
-            nFeeRet = nTransactionFee;
-            while (true)
-            {
-                wtxNew.vin.clear();
-                wtxNew.vout.clear();
-                wtxNew.fFromMe = true;
-
-                int64 nTotalValue = nValue + nFeeRet;
-                double dPriority = 0;
-                // vouts to the payees                                                  vouts к получателям
-                BOOST_FOREACH (const PAIRTYPE(CScript, int64)& s, vecSend)
-                {
-                    CTxOut txout(s.second, s.first);
-                    if (txout.IsDust(CTransaction::nMinRelayTxFee))
-                    {
-                        strFailReason = _("Transaction amount too small");
-                        return false;
-                    }
-                    wtxNew.vout.push_back(txout);
-                }
-
-                // Choose coins to use                                                  Выбор монет для использования
-                set<pair<const CWalletTx*,unsigned int> > setCoins;
-                int64 nValueIn = 0;
-                if (!SelectCoins(nTotalValue, setCoins, nValueIn))
-                {
-                    strFailReason = _("Insufficient funds");
-                    return false;
-                }
-                BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)
-                {
-                    int64 nCredit = pcoin.first->vout[pcoin.second].nValue;
-                    //The priority after the next block (depth+1) is used instead       Приоритет после очередного блока (глубина+1) используют вместо
-                    //of the current, reflecting an assumption the user would accept    текущего, отражающая предположение пользователем принятия
-                    //a bit more delay for a chance at a free transaction.              немного больше задержка для получения шанса на бесплатную операцию.
-                    dPriority += (double)nCredit * (pcoin.first->GetDepthInMainChain()+1);
-                }
-
-                int64 nChange = nValueIn - nValue - nFeeRet;
-                // if sub-cent change is required, the fee must be raised to at least   Если суб-цент изменение требуется, плата должна быть повышена, по крайней мере
-                // nMinTxFee or until nChange becomes zero                              nMinTxFee или пока nChange не станет равным нулю
-                // NOTE: this depends on the exact behaviour of GetMinFee               Примечание: Это зависит от точного поведения GetMinFee
-                if (nFeeRet < CTransaction::nMinTxFee && nChange > 0 && nChange < CENT)
-                {
-                    int64 nMoveToFee = min(nChange, CTransaction::nMinTxFee - nFeeRet);
-                    nChange -= nMoveToFee;
-                    nFeeRet += nMoveToFee;
-                }
-
-                if (nChange > 0)
-                {
-                    // Note: We use a new key here to keep it from being obvious which side is the change.
-                    //  The drawback is that by not reusing a previous key, the change may be lost if a
-                    //  backup is restored, if the backup doesn't have the new private key for the change.
-                    //  If we reused the old key, it would be possible to add code to look for and
-                    //  rediscover unknown transactions that were written with keys of ours to recover
-                    //  post-backup change.
-                    //
-                    // Примечание: Мы используем новый ключ здесь, чтобы держать это не очевидным, какая сторона будет изменена.
-                    //  Недостатком является то, что для  не повторно использованием предыдущего ключа, изменения могут быть потеряны,
-                    //  если резервная копия восстанавливается, если резервная копия не имеет новый секретный ключ для изменения.
-                    //  Если мы повторяем старый ключ, можно было бы добавить код, чтобы искать и
-                    //  заново открыть для себя неизвестные транзакции, которые были написаны с ключами нашего восстановиться после резервного
-                    //  копирования изменений.
-
-                    // Reserve a new key pair from key pool                             Резервируем новую пару ключей от ключевого бассейна
-                    CPubKey vchPubKey;
-                    assert(reservekey.GetReservedKey(vchPubKey)); // should never fail, as we just unlocked     (никогда не должен терпеть неудачу, поскольку мы только unlocked)
-
-                    // Fill a vout to ourself                                           Заполнение vout непосредственно
-                    // TODO: pass in scriptChange instead of reservekey so              TODO: пароль в scriptChange вместо reservekey
-                    // change transaction isn't always pay-to-bitcoin-address           поэтому изменение транзакции не всегда платить_на_bitcoin-адрес
-                    CScript scriptChange;
-                    scriptChange.SetDestination(vchPubKey.GetID());
-
-                    CTxOut newTxOut(nChange, scriptChange);
-
-                    // Never create dust outputs; if we would, just                     Никогда не создавайте пыль выходами;
-                    // add the dust to the fee.                                         Если мы хотим, просто добавьте пыль в плату.
-                    if (newTxOut.IsDust(CTransaction::nMinRelayTxFee))
-                    {
-                        nFeeRet += nChange;
-                        reservekey.ReturnKey();
-                    }
-                    else
-                    {
-                        // Insert change txn at random position:                        Вставьте изменение TXN в случайную позицию:
-                        vector<CTxOut>::iterator position = wtxNew.vout.begin()+GetRandInt(wtxNew.vout.size()+1);
-                        wtxNew.vout.insert(position, newTxOut);
-                    }
-                }
-                else
-                    reservekey.ReturnKey();
-
-                // Fill vin
-                BOOST_FOREACH(const PAIRTYPE(const CWalletTx*,unsigned int)& coin, setCoins)
-                    wtxNew.vin.push_back(CTxIn(coin.first->GetHash(),coin.second));
-
-                // Sign
-                int nIn = 0;
-                BOOST_FOREACH(const PAIRTYPE(const CWalletTx*,unsigned int)& coin, setCoins)
-                    if (!SignSignature(*this, *coin.first, wtxNew, nIn++))
-                    {
-                        strFailReason = _("Signing transaction failed");
-                        return false;
-                    }
-
-                // Limit size
-                unsigned int nBytes = ::GetSerializeSize(*(CTransaction*)&wtxNew, SER_NETWORK, PROTOCOL_VERSION);
-                if (nBytes >= MAX_STANDARD_TX_SIZE)
-                {
-                    strFailReason = _("Transaction too large");
-                    return false;
-                }
-                dPriority /= nBytes;
-
-                // Check that enough fee is included                                    Проверьте, достаточно ли платы(комиссии) включено
-                int64 nPayFee = nTransactionFee * (1 + (int64)nBytes / 1000);
-                bool fAllowFree = AllowFree(dPriority);
-                int64 nMinFee = GetMinFee(wtxNew, fAllowFree, GMF_SEND);
-                if (nFeeRet < max(nPayFee, nMinFee))
-                {
-                    nFeeRet = max(nPayFee, nMinFee);
-                    continue;
-                }
-
-                // Fill vtxPrev by copying from previous transactions vtxPrev           Заполнение vtxPrev путем копирования из предыдущих сделок vtxPrev
-                wtxNew.AddSupportingTransactions();
-                wtxNew.fTimeReceivedIsTxTime = true;
-
-                break;
-            }
-        }
-    }
-    return true;
-}
-
-
-
-
-
-
-
-
-
-
-
 /*************************** новое ******************************/
-
-
 bool CWallet::CreateTransaction(const vector<pair<CScript, int64> >& vecSend,
-                                CWalletTx& wtxNew, CReserveKey& reservekey, int64& nFeeRet, std::string& strFailReason)
+                                CWalletTx& wtx, CReserveKey& reservekey, int64& nFeeRet, std::string& strFailReason)
 {
-    int linkingTr = pindexBest->nHeight - 1;  // привязка тр. к блоку(любому существующему???)
-    wtxNew.tBlock = linkingTr;                                              ////////// новое //////////
+    int linkingTr = pindexBest->nHeight - TX_TBLOCK;  // привязка тр. к блоку(любому существующему???)
+    wtx.tBlock = linkingTr;
 
 
     int64 nValue = 0;
@@ -1375,25 +1094,25 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64> >& vecSend,
         return false;
     }
 
-    wtxNew.BindWallet(this);
+    wtx.BindWallet(this);
 
     {
         LOCK2(cs_main, cs_wallet);
         {
-            TransM trM;                                                     ////////// новое //////////
-            trM.hashBlock = vBlockIndexByHeight[linkingTr]->GetBlockHash(); ////////// новое //////////
+            TransM trM;
+            trM.hashBlock = vBlockIndexByHeight[linkingTr]->GetBlockHash();
 
-            nFeeRet = nTransactionFee + nMinerTransFee;                     ////////// новое //////////
+            nFeeRet = nTransactionFee + nMinerTransFee;
             while (true)
             {
-                wtxNew.vin.clear();
-                wtxNew.vout.clear();
-                wtxNew.fFromMe = true;
+                wtx.vin.clear();
+                wtx.vout.clear();
+                wtx.fFromMe = true;
 
                 int64 nTotalValue = nValue + nFeeRet;
                 double dPriority = 0;
                 // vouts to the payees                                                  vouts к получателям
-                trM.voutM.clear();                                          ////////// новое //////////
+                trM.voutM.clear();
                 BOOST_FOREACH (const PAIRTYPE(CScript, int64)& s, vecSend)
                 {
                     CTxOut txout(s.second, s.first);
@@ -1402,10 +1121,10 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64> >& vecSend,
                         strFailReason = _("Transaction amount too small");
                         return false;
                     }
-                    wtxNew.vout.push_back(txout);
+                    wtx.vout.push_back(txout);
 
-                    txout.scriptPubKey = CScript();                         ////////// новое //////////
-                    trM.voutM.push_back(txout);                             ////////// новое //////////
+                    txout.scriptPubKey = CScript();
+                    trM.voutM.push_back(txout);
                 }
 
                 // Choose coins to use                                                  Выбор монет для использования
@@ -1423,14 +1142,14 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64> >& vecSend,
                     //of the current, reflecting an assumption the user would accept    текущего, отражающая предположение пользователем принятия
                     //a bit more delay for a chance at a free transaction.              немного больше задержка для получения шанса на бесплатную операцию.
                     dPriority += (double)nCredit * (pcoin.first->GetDepthInMainChain()+1);      // GetDepthInMainChain() может пригодиться
-                }                                                                               // усли убрать из CTransaction tBlock;
+                }                                                                               // если убрать из CTransaction tBlock;
 
                 // Fill vin
                 BOOST_FOREACH(const PAIRTYPE(const CWalletTx*,unsigned int)& coin, setCoins)
-                    wtxNew.vin.push_back(CTxIn(coin.first->GetHash(),coin.second));
+                    wtx.vin.push_back(CTxIn(coin.first->GetHash(), coin.second));     // scriptSig здесь пустой(почему пустой???)
 
-                trM.vinM.clear();                                           ////////// новое //////////
-                trM.vinM = wtxNew.vin;                                      ////////// новое //////////
+                trM.vinM.clear();
+                trM.vinM = wtx.vin;
 
                 int64 nChange = nValueIn - nValue - nFeeRet;
                 // if sub-cent change is required, the fee must be raised to at least   Если суб-цент изменение требуется, плата должна быть повышена, по крайней мере
@@ -1468,39 +1187,34 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64> >& vecSend,
                     {
                         // Insert change txn at random position:                        Вставьте изменение TXN в случайную позицию:
 
-                        int pos = GetRandInt(wtxNew.vout.size() + 1);               ////////// новое //////////
-                        vector<CTxOut>::iterator position = wtxNew.vout.begin() + pos;
-                        wtxNew.vout.insert(position, newTxOut);
-
-
+                        int pos = GetRandInt(wtx.vout.size() + 1);
+                        vector<CTxOut>::iterator position = wtx.vout.begin() + pos;
+                        wtx.vout.insert(position, newTxOut);
 
                         newTxOut.scriptPubKey = CScript();
                         vector<CTxOut>::iterator positionM = trM.voutM.begin() + pos;
                         trM.voutM.insert(positionM, newTxOut);
 
-                        int64 newValue = 0;
+                        int64 newValue = trM.voutM[pos].nValue;
                         uint256 hashTr = SerializeHash(trM);
-
-                        if (nMinerTransFee > 0)                                     ////////// новое //////////
+                        lyra2re2_hashTX(BEGIN(hashTr), BEGIN(hashTr), 32);
+                        if (nMinerTransFee > 0)
                         {
                             for (int n = 0; n < nMinerTransFee; n++)
                             {
                                 trM.voutM[pos].nValue += 1;
                                 uint256 hT = SerializeHash(trM);
+                                lyra2re2_hashTX(BEGIN(hT), BEGIN(hT), 32);
 
                                 if (hashTr > hT)
                                 {
                                     hashTr = hT;
                                     newValue = trM.voutM[pos].nValue;
-//printf("===>> trM      hashTr: %s   n = %d   newValue = %"PRI64d"\n", hashTr.GetHex().c_str(), n, newValue);
                                 }
                             }
-
-                            wtxNew.vout[pos].nValue = newValue;
-
+                            wtx.vout[pos].nValue = newValue;
                             trM.voutM[pos].nValue = newValue;
                         }
-
                     }
                 }
                 else
@@ -1509,17 +1223,20 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64> >& vecSend,
                 // Sign
                 int nIn = 0;
                 BOOST_FOREACH(const PAIRTYPE(const CWalletTx*,unsigned int)& coin, setCoins)
-                    if (!SignSignature(*this, *coin.first, wtxNew, nIn++))
+                    if (!SignSignature(*this, *coin.first, wtx, nIn++))
                     {
                         strFailReason = _("Signing transaction failed");
                         return false;
                     }
 
-printf("\n===>> wtxNew  GetHash: %s     nFeeRet = %"PRI64d"\n", wtxNew.GetHash().GetHex().c_str(), nFeeRet);
-printf("\n===>> trM      hashTr: %s     nFeeRet = %"PRI64d"\n", SerializeHash(trM).GetHex().c_str(), nFeeRet);
+printf("\n===>> wtx       GetHash: %s     nFeeRet = %"PRI64d"\n", wtx.GetHash().GetHex().c_str(), nFeeRet);
+uint256 hashTr = SerializeHash(trM);
+lyra2re2_hashTX(BEGIN(hashTr), BEGIN(hashTr), 32);
+printf("===>> trM lyra   hashTr: %s     nFeeRet = %"PRI64d"\n", hashTr.GetHex().c_str(), nFeeRet);
+//printf("===>> trM sha    hashTr: %s     nFeeRet = %"PRI64d"\n\n", SerializeHash(trM).GetHex().c_str(), nFeeRet);
 
                 // Limit size
-                unsigned int nBytes = ::GetSerializeSize(*(CTransaction*)&wtxNew, SER_NETWORK, PROTOCOL_VERSION);
+                unsigned int nBytes = ::GetSerializeSize(*(CTransaction*)&wtx, SER_NETWORK, PROTOCOL_VERSION);
                 if (nBytes >= MAX_STANDARD_TX_SIZE)
                 {
                     strFailReason = _("Transaction too large");
@@ -1530,20 +1247,17 @@ printf("\n===>> trM      hashTr: %s     nFeeRet = %"PRI64d"\n", SerializeHash(tr
                 // Check that enough fee is included                                    Проверьте, достаточно ли платы(комиссии) включено
                 int64 nPayFee = nTransactionFee * (1 + (int64)nBytes / 1000);
                 bool fAllowFree = AllowFree(dPriority);
-//printf("\n===>> 1\n");
-                int64 nMinFee = GetMinFee(wtxNew, fAllowFree, GMF_SEND);
-//printf("\n===>> 2\n");
+                int64 nMinFee = GetMinFee(wtx, fAllowFree, GMF_SEND);
                 if (nFeeRet < max(nPayFee, nMinFee))
                 {
-//                    nFeeRet = max(nPayFee, nMinFee);
-                    nFeeRet = max(nPayFee, nMinFee) + nMinerTransFee;                 ////////// новое //////////
+                    nFeeRet = max(nPayFee, nMinFee) + nMinerTransFee;
+//printf("===>>       nFeeRet < max(nPayFee, nMinFee)\n");
                     continue;
                 }
 
                 // Fill vtxPrev by copying from previous transactions vtxPrev           Заполнение vtxPrev путем копирования из предыдущих сделок vtxPrev
-                wtxNew.AddSupportingTransactions();
-                wtxNew.fTimeReceivedIsTxTime = true;
-//printf("\n===>> 3\n");
+                wtx.AddSupportingTransactions();
+                wtx.fTimeReceivedIsTxTime = true;
 
                 break;
             }
@@ -1551,30 +1265,23 @@ printf("\n===>> trM      hashTr: %s     nFeeRet = %"PRI64d"\n", SerializeHash(tr
     }
     return true;
 }
-
-
-
-
-
-
-
-
+/*************************** новое ******************************/
 
 
 bool CWallet::CreateTransaction(CScript scriptPubKey, int64 nValue,
-                                CWalletTx& wtxNew, CReserveKey& reservekey, int64& nFeeRet, std::string& strFailReason)
+                                CWalletTx& wtx, CReserveKey& reservekey, int64& nFeeRet, std::string& strFailReason)
 {
     vector< pair<CScript, int64> > vecSend;
     vecSend.push_back(make_pair(scriptPubKey, nValue));
-    return CreateTransaction(vecSend, wtxNew, reservekey, nFeeRet, strFailReason);
+    return CreateTransaction(vecSend, wtx, reservekey, nFeeRet, strFailReason);
 }
 
 // Call after CreateTransaction unless you want to abort                                Вызывайте помле CreateTransaction если вы не хотите, чтобы прервалось
-bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
+bool CWallet::CommitTransaction(CWalletTx& wtx, CReserveKey& reservekey)
 {
     {
         LOCK2(cs_main, cs_wallet);
-        printf("CommitTransaction:\n%s", wtxNew.ToString().c_str());
+        printf("CommitTransaction:\n%s", wtx.ToString().c_str());
         {
             // This is only to keep the database open to defeat the auto-flush for the  Это только, чтобы сохранить базу данных открытой, чтобы победить авто-сброс
             // duration of this scope.  This is the only place where this optimization  продолжительным этого применения. Это единственное место, где эта оптимизация
@@ -1586,11 +1293,11 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
 
             // Add tx to wallet, because if it has change it's also ours,               Добавить TX на кошелек, потому что, если у него есть изменения, это также наша,
             // otherwise just for transaction history.                                  в противном случае просто для истории транзакций.
-            AddToWallet(wtxNew);
+            AddToWallet(wtx);
 
             // Mark old coins as spent                                                  Отметить(пометить) старые монеты, как потраченные
             set<CWalletTx*> setCoins;
-            BOOST_FOREACH(const CTxIn& txin, wtxNew.vin)
+            BOOST_FOREACH(const CTxIn& txin, wtx.vin)
             {
                 CWalletTx &coin = mapWallet[txin.prevout.hash];
                 coin.BindWallet(this);
@@ -1604,16 +1311,16 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
         }
 
         // Track how many getdata requests our transaction gets                         Отслеживать, сколько GetData запросов наша транзакция получает
-        mapRequestCount[wtxNew.GetHash()] = 0;
+        mapRequestCount[wtx.GetHash()] = 0;
 
         // Broadcast (передача)
-        if (!wtxNew.AcceptToMemoryPool(false))
+        if (!wtx.AcceptToMemoryPool(false))
         {
             // This must not fail. The transaction has already been signed and recorded.    Это не должны подвести. Транзакция уже подписана и зарегистрированна.
             printf("CommitTransaction() : Error: Transaction not valid");
             return false;
         }
-        wtxNew.RelayWalletTransaction();
+        wtx.RelayWalletTransaction();
     }
     return true;
 }
@@ -1621,7 +1328,7 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
 
 
 
-string CWallet::SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, bool fAskFee)
+string CWallet::SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtx, bool fAskFee)
 {
     CReserveKey reservekey(this);
     int64 nFeeRequired;
@@ -1633,7 +1340,7 @@ string CWallet::SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew,
         return strError;
     }
     string strError;
-    if (!CreateTransaction(scriptPubKey, nValue, wtxNew, reservekey, nFeeRequired, strError))
+    if (!CreateTransaction(scriptPubKey, nValue, wtx, reservekey, nFeeRequired, strError))
     {
         if (nValue + nFeeRequired > GetBalance())
             strError = strprintf(_("Error: This transaction requires a transaction fee of at least %s because of its amount, complexity, or use of recently received funds!"), FormatMoney(nFeeRequired).c_str());
@@ -1644,7 +1351,7 @@ string CWallet::SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew,
     if (fAskFee && !uiInterface.ThreadSafeAskFee(nFeeRequired))
         return "ABORTED";
 
-    if (!CommitTransaction(wtxNew, reservekey))
+    if (!CommitTransaction(wtx, reservekey))
         return _("Error: The transaction was rejected! This might happen if some of the coins in your wallet were already spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here.");
 
     return "";
@@ -1652,7 +1359,7 @@ string CWallet::SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew,
 
 
 
-string CWallet::SendMoneyToDestination(const CTxDestination& address, int64 nValue, CWalletTx& wtxNew, bool fAskFee)
+string CWallet::SendMoneyToDestination(const CTxDestination& address, int64 nValue, CWalletTx& wtx, bool fAskFee)
 {
     // Check amount
     if (nValue <= 0)
@@ -1664,7 +1371,7 @@ string CWallet::SendMoneyToDestination(const CTxDestination& address, int64 nVal
     CScript scriptPubKey;
     scriptPubKey.SetDestination(address);
 
-    return SendMoney(scriptPubKey, nValue, wtxNew, fAskFee);
+    return SendMoney(scriptPubKey, nValue, wtx, fAskFee);
 }
 
 

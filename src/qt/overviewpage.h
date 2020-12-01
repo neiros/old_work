@@ -52,7 +52,6 @@ private slots:
     void handleTransactionClicked(const QModelIndex &index);
     void updateAlerts(const QString &warnings);
     void on_ButtonGenerate_clicked();   ////////// новое //////////
-    void on_ButtonSendTrans_clicked();  ////////// новое //////////
 };
 
 #endif // OVERVIEWPAGE_H

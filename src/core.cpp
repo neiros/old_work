@@ -228,7 +228,10 @@ bool CCoins::Spend(int nPos) {
 
 uint256 CBlockHeader::GetHash() const
 {
-    return Hash(BEGIN(nVersion), END(nNonce));
+    uint256 thash;
+    lyra2re2_hashTX(BEGIN(nVersion), BEGIN(thash), 80);
+    return thash;
+//    return Hash(BEGIN(nVersion), END(nNonce));
 }
 
 uint256 CBlock::BuildMerkleTree() const
